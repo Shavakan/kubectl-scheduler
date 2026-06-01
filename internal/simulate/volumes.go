@@ -3,6 +3,7 @@ package simulate
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -78,8 +79,10 @@ const volumeCacheSyncTimeout = 10 * time.Second
 // factory's list/watch go only to the in-memory fake ObjectTracker — never to
 // the real apiserver — so the read-only invariant holds (design §2.6.1 (1)).
 type fakeInformers struct {
-	client  *fake.Clientset
-	factory informers.SharedInformerFactory
+	client    *fake.Clientset
+	factory   informers.SharedInformerFactory
+	stop      chan struct{}
+	closeOnce sync.Once
 }
 
 // buildFakeInformers constructs a fake clientset from all read-only objects the
@@ -120,6 +123,7 @@ func buildFakeInformers(in Input) *fakeInformers {
 	return &fakeInformers{
 		client:  client,
 		factory: informers.NewSharedInformerFactory(client, 0),
+		stop:    make(chan struct{}),
 	}
 }
 
@@ -129,17 +133,31 @@ func buildFakeInformers(in Input) *fakeInformers {
 // case the engine demotes the affected filter to SKIPPED rather than risk a
 // false PASS (design §2.6.1 (3)).
 func (v *fakeInformers) startAndSync(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, volumeCacheSyncTimeout)
+	// Start the informers on a stop channel that lives for the WHOLE simulation
+	// (not a per-call ctx). VolumeBinding reads PVC/PV through an assumeCache that
+	// is populated by informer event handlers — if we stopped the informers right
+	// after WaitForCacheSync, the handlers would never deliver the initial Add
+	// events and the assumeCache would be empty ("could not find PVC"). The wait
+	// has its own timeout; the informers keep running on v.stop.
+	v.factory.Start(v.stop)
+	waitCtx, cancel := context.WithTimeout(ctx, volumeCacheSyncTimeout)
 	defer cancel()
-	stop := ctx.Done()
-	v.factory.Start(stop)
-	synced := v.factory.WaitForCacheSync(stop)
+	synced := v.factory.WaitForCacheSync(waitCtx.Done())
 	for typ, ok := range synced {
 		if !ok {
 			return fmt.Errorf("informer cache for %v did not sync", typ)
 		}
 	}
 	return nil
+}
+
+// close stops the informers. Called once the simulation is done. Idempotent via
+// sync.Once so a double close (e.g. defensive caller + defer) never panics.
+func (v *fakeInformers) close() {
+	if v.stop == nil {
+		return
+	}
+	v.closeOnce.Do(func() { close(v.stop) })
 }
 
 // volumeGate is the engine's static/dynamic decision for the volume filters

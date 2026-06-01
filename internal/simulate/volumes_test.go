@@ -1,6 +1,7 @@
 package simulate
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -28,9 +29,17 @@ func podWithPVC(claimName string) *corev1.Pod {
 func boundPVC(name, ns, pvName string) *corev1.PersistentVolumeClaim {
 	sc := ""
 	return &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName, StorageClassName: &sc},
-		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			// The binder treats a PVC as fully bound only when VolumeName is set AND
+			// the bind-completed annotation is present (isPVCFullyBound); without it
+			// the PVC is classified "unbound immediate" and node-affinity is never
+			// checked.
+			Annotations: map[string]string{"pv.kubernetes.io/bind-completed": "yes"},
+		},
+		Spec:   corev1.PersistentVolumeClaimSpec{VolumeName: pvName, StorageClassName: &sc},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
 	}
 }
 
@@ -161,5 +170,100 @@ func TestVolumePoC_VolumeReadError_Skips(t *testing.T) {
 		if r.Verdict != VerdictSkipped {
 			t.Errorf("volume read degraded: filter %s got %s, want SKIPPED", f, r.Verdict)
 		}
+	}
+}
+
+// pvWithNodeAffinity returns a PV bound (static) whose spec.nodeAffinity requires
+// the given zone via topology.kubernetes.io/zone. VolumeBinding reads this PV
+// through its assumeCache (fed by informer event handlers) — NOT the raw lister —
+// so it only sees the PV if the informers stay running past WaitForCacheSync.
+func pvWithNodeAffinity(name, zone string) *corev1.PersistentVolume {
+	pv := zonedPV(name, zone)
+	// Bind the PV back to the PVC so the binder treats the pair as fully bound
+	// (a bound PVC alone is not enough; the binder cross-checks PV.Spec.ClaimRef).
+	pv.Spec.ClaimRef = &corev1.ObjectReference{Kind: "PersistentVolumeClaim", Namespace: "default", Name: "data"}
+	pv.Status.Phase = corev1.VolumeBound
+	pv.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{
+		Required: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      corev1.LabelTopologyZone,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{zone},
+				}},
+			}},
+		},
+	}
+	return pv
+}
+
+// volumeBindingResult runs the FULL Simulate path (which is where the informer
+// lifecycle + defer close() live) and returns the VolumeBinding FilterResult.
+func volumeBindingResult(t *testing.T, in Input) FilterResult {
+	t.Helper()
+	res, err := NewFrameworkSimulator().Simulate(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Simulate: %v", err)
+	}
+	for _, fr := range res.Filters {
+		if fr.Filter == names.VolumeBinding {
+			return fr
+		}
+	}
+	t.Fatalf("VolumeBinding result not found in %v", res.Filters)
+	return FilterResult{}
+}
+
+// TestVolumeBinding_BoundPV_NodeAffinityConflict is the regression test for the
+// assumeCache bug: a bound PVC -> PV whose nodeAffinity requires zone A, against a
+// target node in zone B. VolumeBinding reads the PVC/PV via its assumeCache (fed
+// by informer event handlers), so before the fix (informers stopped right after
+// WaitForCacheSync via `defer cancel()`) the assumeCache was empty and PreFilter
+// failed with "could not find PVC" -> SKIPPED (engine error). After the fix the
+// informers stay up, the assumeCache is populated, and the filter correctly FAILs
+// with a node-affinity conflict.
+//
+// This drives the full Simulate path so the engine's `defer close()` runs too.
+func TestVolumeBinding_BoundPV_NodeAffinityConflict(t *testing.T) {
+	target := node("n1")
+	target.Labels[corev1.LabelTopologyZone] = "zoneB"
+
+	r := volumeBindingResult(t, Input{
+		Pod:      podWithPVC("data"),
+		Node:     target,
+		AllNodes: []*corev1.Node{target},
+		PVCs:     []*corev1.PersistentVolumeClaim{boundPVC("data", "default", "pv1")},
+		PVs:      []*corev1.PersistentVolume{pvWithNodeAffinity("pv1", "zoneA")},
+	})
+
+	if r.Verdict == VerdictSkipped {
+		t.Fatalf("regression: VolumeBinding SKIPPED (%s) — assumeCache empty, informers stopped too early", r.SkipDetail)
+	}
+	if r.Verdict != VerdictFail {
+		t.Fatalf("bound PV requires zoneA, target node in zoneB: got %s (%s/%s), want FAIL", r.Verdict, r.Reason, r.SkipDetail)
+	}
+	if r.Reason == "" {
+		t.Errorf("FAIL verdict must carry a human-readable reason (node affinity conflict), got empty")
+	}
+}
+
+// TestVolumeBinding_BoundPV_NodeAffinityMatch is the contrast case: the same bound
+// PVC -> PV but the PV nodeAffinity matches the target node's zone -> PASS. This
+// also exercises the assumeCache read path (PV/PVC must be found), so it would
+// likewise have SKIPPED before the fix.
+func TestVolumeBinding_BoundPV_NodeAffinityMatch(t *testing.T) {
+	target := node("n1")
+	target.Labels[corev1.LabelTopologyZone] = "zoneA"
+
+	r := volumeBindingResult(t, Input{
+		Pod:      podWithPVC("data"),
+		Node:     target,
+		AllNodes: []*corev1.Node{target},
+		PVCs:     []*corev1.PersistentVolumeClaim{boundPVC("data", "default", "pv1")},
+		PVs:      []*corev1.PersistentVolume{pvWithNodeAffinity("pv1", "zoneA")},
+	})
+
+	if r.Verdict != VerdictPass {
+		t.Fatalf("bound PV nodeAffinity matches target node zone: got %s (%s/%s), want PASS", r.Verdict, r.Reason, r.SkipDetail)
 	}
 }

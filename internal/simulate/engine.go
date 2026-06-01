@@ -115,6 +115,10 @@ func (s *frameworkSimulator) Simulate(ctx context.Context, in Input) (*Simulatio
 	// h.SharedInformerFactory() — passing nil panics. The factory's list/watch
 	// hit only the in-memory fake, never the real apiserver (design §2.6).
 	sc := newSimContext(ctx, in)
+	// The informer factory's goroutines run for the whole simulation (the
+	// VolumeBinding assumeCache is fed by informer event handlers, design note in
+	// volumes.go). Stop them when the simulation returns to avoid a goroutine leak.
+	defer sc.informers.close()
 
 	results := make([]FilterResult, 0, len(enabledFilters))
 	for _, ef := range enabledFilters {
